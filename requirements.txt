@@ -1,0 +1,25 @@
+# Core dependencies
+fastapi>=0.104.0
+uvicorn>=0.24.0
+streamlit>=1.28.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# Graphiti dependencies
+graphiti-core>=0.1.0
+
+# Database
+neo4j>=5.14.0
+
+# Caching
+functools32>=3.2.3; python_version < "3.2"
+
+# Optional: Redis for distributed caching
+redis>=5.0.0
+
+# Optional: Memory profiling
+psutil>=5.9.0
+
+# Development
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
