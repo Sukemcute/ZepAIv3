@@ -8,6 +8,7 @@ ZepAI là một hệ thống AI Memory Layer sử dụng Knowledge Graph để l
 - **🔍 Semantic Search**: Tìm kiếm thông minh trong knowledge graph
 - **💬 Chat với Memory**: AI assistant nhớ được cuộc trò chuyện
 - **📊 Multi-tier Memory**: Short-term, mid-term, long-term memory
+- **💰 Full Token Tracking**: Track main chat + hidden costs (summarization, decision)
 - **🌐 Multilingual**: Hỗ trợ tiếng Việt và các ngôn ngữ khác
 - **⚡ Caching**: Tối ưu hiệu suất với in-memory cache
 

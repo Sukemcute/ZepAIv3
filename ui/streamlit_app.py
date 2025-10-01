@@ -91,6 +91,14 @@ with tabs[0]:
 
     if "chat_messages" not in st.session_state:
         st.session_state.chat_messages = []  # list of {role, content, token_usage (optional)}
+    
+    # Hidden token tracking (summarization, decision, translation)
+    if "hidden_tokens" not in st.session_state:
+        st.session_state.hidden_tokens = {
+            "summarization": {"prompt": 0, "completion": 0, "total": 0, "count": 0},
+            "decision": {"prompt": 0, "completion": 0, "total": 0, "count": 0},
+            "translation": {"prompt": 0, "completion": 0, "total": 0, "count": 0}
+        }
 
     # Initialize session states first
     if "group_id" not in st.session_state:
@@ -140,6 +148,12 @@ with tabs[0]:
             st.session_state.chat_messages = []
             st.session_state.mem_buffer = []
             st.session_state.mem_user_count = 0
+            # Reset hidden tokens
+            st.session_state.hidden_tokens = {
+                "summarization": {"prompt": 0, "completion": 0, "total": 0, "count": 0},
+                "decision": {"prompt": 0, "completion": 0, "total": 0, "count": 0},
+                "translation": {"prompt": 0, "completion": 0, "total": 0, "count": 0}
+            }
             # Auto-generate new group_id when clearing conversation
             import uuid
             st.session_state.group_id = f"chat-{uuid.uuid4()}"
@@ -150,39 +164,99 @@ with tabs[0]:
     current_n = st.session_state.get("ingest_every_n", 5)
     current_window = st.session_state.get("short_term_window", 5)
     
+    # Load OpenAI model early (needed for cost calculation)
+    openai_model = os.getenv("MODEL_NAME", "gpt-4o-mini")
+    
     st.markdown("### 🧠 Memory Configuration")
-    col_info1, col_info2, col_info3 = st.columns(3)
+    col_info1, col_info2, col_info3, col_info4 = st.columns([2, 2, 2, 3])
+    
     with col_info1:
         if current_n == 1:
             st.info("💾 **Mid-term:** Direct save - Each turn → KG immediately")
         else:
             st.info(f"📝 **Mid-term:** Every {current_n} turns → Summarize → KG")
+    
     with col_info2:
         st.info(f"⚡ **Short-term:** Last {current_window} turns kept as context")
+    
+    # Calculate token stats (shared between col3 and col4)
+    main_tokens = 0
+    main_prompt = 0
+    main_completion = 0
+    main_cost = 0.0
+    for msg in st.session_state.chat_messages:
+        if msg.get("token_usage"):
+            usage = msg["token_usage"]
+            main_tokens += usage["total_tokens"]
+            main_prompt += usage["prompt_tokens"]
+            main_completion += usage["completion_tokens"]
+            main_cost += calculate_cost(
+                usage["prompt_tokens"], 
+                usage["completion_tokens"], 
+                usage["model"]
+            )
+    
+    # Calculate hidden costs
+    hidden = st.session_state.hidden_tokens
+    hidden_total = (
+        hidden["summarization"]["total"] + 
+        hidden["decision"]["total"] + 
+        hidden["translation"]["total"]
+    )
+    hidden_cost = calculate_cost(
+        hidden["summarization"]["prompt"] + hidden["decision"]["prompt"] + hidden["translation"]["prompt"],
+        hidden["summarization"]["completion"] + hidden["decision"]["completion"] + hidden["translation"]["completion"],
+        openai_model
+    )
+    
+    # Grand total
+    grand_total = main_tokens + hidden_total
+    grand_cost = main_cost + hidden_cost
+    
     with col_info3:
-        # Calculate total token usage and cost
-        total_tokens = 0
-        total_prompt = 0
-        total_completion = 0
-        total_cost = 0.0
-        for msg in st.session_state.chat_messages:
-            if msg.get("token_usage"):
-                usage = msg["token_usage"]
-                total_tokens += usage["total_tokens"]
-                total_prompt += usage["prompt_tokens"]
-                total_completion += usage["completion_tokens"]
-                total_cost += calculate_cost(
-                    usage["prompt_tokens"], 
-                    usage["completion_tokens"], 
-                    usage["model"]
-                )
-        
-        if total_tokens > 0:
-            st.info(f"🔢 **Total Tokens:** {total_tokens:,}\n\n"
-                   f"↘️ Out: {total_completion:,}| ↗️ In: {total_prompt:,}\n\n"
-                   f"💰 **Cost:** ${total_cost:.4f}")
+        if grand_total > 0:
+            st.info(
+                f"🔢 **Total Tokens:** {grand_total:,}\n\n"
+                f"💬 Chat: {main_tokens:,} | 🔧 Hidden: {hidden_total:,}\n\n"
+                f"💰 **Cost:** ${grand_cost:.4f}"
+            )
         else:
             st.info("🔢 **Total Tokens:** 0\n\nNo usage yet")
+    
+    with col_info4:
+        # Token Breakdown in separate column
+        if grand_total > 0:
+            with st.expander("📊 Token Breakdown", expanded=False):
+                st.markdown("### Main Chat")
+                st.write(f"- Output: {main_completion:,} tokens")
+                st.write(f"- Input: {main_prompt:,} tokens")
+                st.write(f"- Total: {main_tokens:,} tokens")
+                st.write(f"- Cost: ${main_cost:.4f}")
+                
+                st.markdown("### Hidden Costs")
+                
+                # Summarization
+                if hidden["summarization"]["count"] > 0:
+                    st.write(f"**Summarization** ({hidden['summarization']['count']} calls):")
+                    st.write(f"  - Tokens: {hidden['summarization']['total']:,}")
+                    st.write(f"  - Cost: ${calculate_cost(hidden['summarization']['prompt'], hidden['summarization']['completion'], openai_model):.4f}")
+                
+                # Decision
+                if hidden["decision"]["count"] > 0:
+                    st.write(f"**Decision** ({hidden['decision']['count']} calls):")
+                    st.write(f"  - Tokens: {hidden['decision']['total']:,}")
+                    st.write(f"  - Cost: ${calculate_cost(hidden['decision']['prompt'], hidden['decision']['completion'], openai_model):.4f}")
+                
+                # Translation
+                if hidden["translation"]["count"] > 0:
+                    st.write(f"**Translation** ({hidden['translation']['count']} calls):")
+                    st.write(f"  - Tokens: {hidden['translation']['total']:,}")
+                    st.write(f"  - Cost: ${calculate_cost(hidden['translation']['prompt'], hidden['translation']['completion'], openai_model):.4f}")
+                
+                st.markdown("---")
+                st.markdown(f"### Grand Total")
+                st.write(f"- Total Tokens: {grand_total:,}")
+                st.write(f"- Total Cost: ${grand_cost:.4f}")
     
     # Group ID Management
     st.markdown("### 🔑 Conversation Group ID")
@@ -246,9 +320,8 @@ with tabs[0]:
         else:
             st.error(f"Export failed: {data}")
 
-    # OpenAI config
+    # OpenAI config (model already loaded above)
     openai_key = os.getenv("OPENAI_API_KEY")
-    openai_model = os.getenv("MODEL_NAME", "gpt-4.1-mini")
 
     # Process user input if exists (will be rendered at bottom)
     user_input = st.session_state.get("_pending_input", None)
@@ -322,6 +395,13 @@ with tabs[0]:
                     max_tokens=decision_config.get("max_tokens", 10),
                 )
                 wants_kg = decision.choices[0].message.content.strip().upper().startswith("Y")
+                
+                # Track decision tokens
+                if hasattr(decision, 'usage') and decision.usage:
+                    st.session_state.hidden_tokens["decision"]["prompt"] += decision.usage.prompt_tokens
+                    st.session_state.hidden_tokens["decision"]["completion"] += decision.usage.completion_tokens
+                    st.session_state.hidden_tokens["decision"]["total"] += decision.usage.total_tokens
+                    st.session_state.hidden_tokens["decision"]["count"] += 1
             except Exception:
                 pass
 
@@ -485,6 +565,16 @@ with tabs[0]:
                             max_tokens=sum_config.get("max_tokens", 250),  # Increased for multiple facts
                         )
                         summary_text = comp.choices[0].message.content.strip()
+                        
+                        # Track summarization tokens
+                        if hasattr(comp, 'usage') and comp.usage:
+                            st.session_state.hidden_tokens["summarization"]["prompt"] += comp.usage.prompt_tokens
+                            st.session_state.hidden_tokens["summarization"]["completion"] += comp.usage.completion_tokens
+                            st.session_state.hidden_tokens["summarization"]["total"] += comp.usage.total_tokens
+                            st.session_state.hidden_tokens["summarization"]["count"] += 1
+                            
+                            if show_memories:
+                                st.caption(f"📝 Summarization tokens: {comp.usage.total_tokens} ({comp.usage.prompt_tokens} in + {comp.usage.completion_tokens} out)")
                     except Exception:
                         summary_text = None
                 if not summary_text:
