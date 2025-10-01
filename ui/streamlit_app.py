@@ -16,6 +16,26 @@ from app.prompts import format_decision_prompt, format_system_prompt, format_sum
 # Load .env placed at memory_layer/.env so UI and API share config
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
 
+# OpenAI pricing (USD per 1M tokens) - updated Jan 2024
+OPENAI_PRICING = {
+    "gpt-4o": {"input": 2.50, "output": 10.00},
+    "gpt-4o-mini": {"input": 0.150, "output": 0.600},
+    "gpt-4-turbo": {"input": 10.00, "output": 30.00},
+    "gpt-4": {"input": 30.00, "output": 60.00},
+    "gpt-3.5-turbo": {"input": 0.50, "output": 1.50},
+}
+
+def calculate_cost(prompt_tokens: int, completion_tokens: int, model: str) -> float:
+    """Calculate cost in USD based on token usage and model"""
+    # Try to match model name (handle versioned names like gpt-4-0125-preview)
+    for model_key, pricing in OPENAI_PRICING.items():
+        if model_key in model:
+            input_cost = (prompt_tokens / 1_000_000) * pricing["input"]
+            output_cost = (completion_tokens / 1_000_000) * pricing["output"]
+            return input_cost + output_cost
+    # Default fallback (use gpt-4o-mini pricing)
+    return ((prompt_tokens / 1_000_000) * 0.150) + ((completion_tokens / 1_000_000) * 0.600)
+
 
 def get_api_base_url() -> str:
     env_url = os.getenv("MEMORY_LAYER_API", "http://127.0.0.1:8000")
@@ -70,7 +90,7 @@ with tabs[0]:
     st.subheader("Chat with Memory")
 
     if "chat_messages" not in st.session_state:
-        st.session_state.chat_messages = []  # list of {role, content}
+        st.session_state.chat_messages = []  # list of {role, content, token_usage (optional)}
 
     # Initialize session states first
     if "group_id" not in st.session_state:
@@ -131,7 +151,7 @@ with tabs[0]:
     current_window = st.session_state.get("short_term_window", 5)
     
     st.markdown("### 🧠 Memory Configuration")
-    col_info1, col_info2 = st.columns(2)
+    col_info1, col_info2, col_info3 = st.columns(3)
     with col_info1:
         if current_n == 1:
             st.info("💾 **Mid-term:** Direct save - Each turn → KG immediately")
@@ -139,6 +159,30 @@ with tabs[0]:
             st.info(f"📝 **Mid-term:** Every {current_n} turns → Summarize → KG")
     with col_info2:
         st.info(f"⚡ **Short-term:** Last {current_window} turns kept as context")
+    with col_info3:
+        # Calculate total token usage and cost
+        total_tokens = 0
+        total_prompt = 0
+        total_completion = 0
+        total_cost = 0.0
+        for msg in st.session_state.chat_messages:
+            if msg.get("token_usage"):
+                usage = msg["token_usage"]
+                total_tokens += usage["total_tokens"]
+                total_prompt += usage["prompt_tokens"]
+                total_completion += usage["completion_tokens"]
+                total_cost += calculate_cost(
+                    usage["prompt_tokens"], 
+                    usage["completion_tokens"], 
+                    usage["model"]
+                )
+        
+        if total_tokens > 0:
+            st.info(f"🔢 **Total Tokens:** {total_tokens:,}\n\n"
+                   f"↘️ Out: {total_completion:,}| ↗️ In: {total_prompt:,}\n\n"
+                   f"💰 **Cost:** ${total_cost:.4f}")
+        else:
+            st.info("🔢 **Total Tokens:** 0\n\nNo usage yet")
     
     # Group ID Management
     st.markdown("### 🔑 Conversation Group ID")
@@ -329,7 +373,7 @@ with tabs[0]:
                 
                 # Debug: Show current config and memory usage
                 if show_memories:
-                    st.info(f"🔧 LLM Config: max_tokens={chat_config.get('max_tokens', 5000)}, temp={chat_config.get('temperature', 0.7)}")
+                    st.info(f"🔧 LLM Config: max_tokens={chat_config.get('max_tokens', 5000)}, temp={chat_config.get('temperature', 0.9)}")
                     st.caption(f"⚡ Short-term: Using last {len(history)} messages ({len(history)//2} turns)")
                     
                     if top_facts:
@@ -359,10 +403,21 @@ with tabs[0]:
                 completion = client.chat.completions.create(
                     model=openai_model,
                     messages=messages_for_llm,
-                    temperature=chat_config.get("temperature", 0.7),
-                    max_tokens=chat_config.get("max_tokens", 5000),  # Fallback to 5000 if config fails
+                    temperature=chat_config.get("temperature", 0.9),
+                    max_tokens=chat_config.get("max_tokens", 5000),  # Fallback to 5000 if config fails -> # AI chỉ được trả lời tối đa 5000 tokens
+                   # (khoảng 3750 chữ hoặc ~15-20 đoạn code)
                 )
                 assistant_reply = completion.choices[0].message.content.strip()
+                
+                # Capture token usage
+                token_usage = None
+                if hasattr(completion, 'usage') and completion.usage:
+                    token_usage = {
+                        "prompt_tokens": completion.usage.prompt_tokens,
+                        "completion_tokens": completion.usage.completion_tokens,
+                        "total_tokens": completion.usage.total_tokens,
+                        "model": openai_model
+                    }
                 
                 # Check if response was truncated
                 if completion.choices[0].finish_reason == "length":
@@ -372,10 +427,29 @@ with tabs[0]:
                 assistant_reply = f"Bạn đã nói: {user_input}"
         else:
             assistant_reply = f"Bạn đã nói: {user_input}"
+            token_usage = None
 
-        st.session_state.chat_messages.append({"role": "assistant", "content": assistant_reply})
+        st.session_state.chat_messages.append({
+            "role": "assistant", 
+            "content": assistant_reply,
+            "token_usage": token_usage
+        })
         with st.chat_message("assistant"):
             st.markdown(assistant_reply)
+            
+            # Display token usage if available
+            if token_usage:
+                cost = calculate_cost(
+                    token_usage['prompt_tokens'], 
+                    token_usage['completion_tokens'], 
+                    token_usage['model']
+                )
+                st.caption(
+                    f"🔢 Tokens: **{token_usage['completion_tokens']}** output | "
+                    f"**{token_usage['prompt_tokens']}** input | "
+                    f"**{token_usage['total_tokens']}** total | "
+                    f"💰 **${cost:.4f}** ({token_usage['model']})"
+                )
 
         # Save assistant turn if auto-save and not summarizing
         if auto_save and not pause_saving and not summarize_to_memory:
@@ -522,6 +596,21 @@ with tabs[0]:
         for msg in st.session_state.chat_messages:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
+                
+                # Display token usage for assistant messages if available
+                if msg["role"] == "assistant" and msg.get("token_usage"):
+                    usage = msg["token_usage"]
+                    cost = calculate_cost(
+                        usage['prompt_tokens'], 
+                        usage['completion_tokens'], 
+                        usage['model']
+                    )
+                    st.caption(
+                        f"🔢 Tokens: **{usage['completion_tokens']}** output | "
+                        f"**{usage['prompt_tokens']}** input | "
+                        f"**{usage['total_tokens']}** total | "
+                        f"💰 **${cost:.4f}** ({usage['model']})"
+                    )
     
     # Chat input at the very bottom
     chat_input = st.chat_input("Type your message")
