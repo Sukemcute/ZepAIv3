@@ -83,7 +83,7 @@ st.caption("Chat, ingest episodes and run search against the FastAPI server")
 api_base = get_api_base_url()
 st.info(f"API base: {api_base}")
 
-tabs = st.tabs(["Chat", "Ingest", "Search", "Cache", "Debug"])
+tabs = st.tabs(["Chat", "Ingest", "Import", "Search", "Cache", "Debug"])
 
 # ---------------------------- Chat Tab ----------------------------
 with tabs[0]:
@@ -792,8 +792,110 @@ with tabs[1]:
 
     st.caption("Tip: Set environment variable MEMORY_LAYER_API to point to a different API base URL.")
 
-# ---------------------------- Search Tab ----------------------------
+# ---------------------------- Import Tab ----------------------------
 with tabs[2]:
+    st.subheader("Import Conversation JSON → Neo4j")
+
+    st.markdown("Upload a JSON exported file in 'mid_term' or 'raw' format to create graph data in Neo4j.")
+
+    uploaded = st.file_uploader("Upload JSON file", type=["json"], key="import_json_uploader")
+    group_override = st.text_input("Override group_id (optional)")
+
+    col_imp1, col_imp2 = st.columns([1,1])
+    with col_imp1:
+        if uploaded is not None:
+            try:
+                content = uploaded.read().decode("utf-8")
+                data = json.loads(content)
+            except Exception as e:
+                st.error(f"Invalid JSON: {e}")
+                data = None
+            else:
+                st.success("✓ File loaded")
+                with st.expander("Preview (truncated)", expanded=False):
+                    st.code(content[:4000] + ("\n..." if len(content) > 4000 else ""), language="json")
+
+                # Show quick stats
+                if isinstance(data, dict):
+                    fmt = data.get("format", "unknown")
+                    if fmt == "mid_term":
+                        st.info(f"Format: mid_term | Entries: {len(data.get('mid_term', []))}")
+                    elif fmt == "raw":
+                        st.info(f"Format: raw | Entities: {len(data.get('entities', []))}")
+                    else:
+                        st.warning("Format not specified. Assuming structure compatible with API.")
+
+    with col_imp2:
+        st.write("")
+        st.write("")
+        if uploaded is not None:
+            if st.button("🚀 Import to Neo4j", type="primary", key="import_btn"):
+                try:
+                    payload = json.loads(content)
+                    if group_override:
+                        payload["group_id"] = group_override
+
+                    # Large file support: chunk mid_term imports to avoid timeouts
+                    if isinstance(payload, dict) and payload.get("format") == "mid_term" and isinstance(payload.get("mid_term"), list) and len(payload["mid_term"]) > 500:
+                        entries = payload["mid_term"]
+                        total = len(entries)
+                        batch_size = 200
+                        imported = 0
+                        failed = 0
+                        pg = st.progress(0.0)
+                        for i in range(0, total, batch_size):
+                            chunk = entries[i:i+batch_size]
+                            chunk_payload = {
+                                "format": "mid_term",
+                                "group_id": payload.get("group_id"),
+                                "mid_term": chunk
+                            }
+                            ok, resp = post_json_timeout("/import/conversation", chunk_payload, timeout_sec=600)
+                            if ok:
+                                imported += resp.get("imported", 0)
+                                failed += resp.get("failed", 0)
+                            else:
+                                failed += len(chunk)
+                                st.warning(f"Batch {i//batch_size+1} failed: {resp}")
+                            pg.progress(min(1.0, (i+batch_size)/total))
+                        st.success(f"Imported: {imported} | Failed: {failed} | Group: {payload.get('group_id')}")
+                    else:
+                        # Single-shot import with extended timeout
+                        ok, resp = post_json_timeout("/import/conversation", payload, timeout_sec=600)
+                        if ok:
+                            st.success(f"Imported: {resp.get('imported', 0)} | Failed: {resp.get('failed', 0)} | Group: {resp.get('group_id')}")
+                            st.json(resp)
+                        else:
+                            st.error("Import failed")
+                            st.json(resp)
+                except Exception as e:
+                    st.error(f"Import error: {e}")
+
+        # Enrich with embeddings & download
+        if uploaded is not None:
+            st.markdown("### ➕ Enrich JSON with embeddings")
+            if st.button("Add embeddings and download", key="embed_json_btn"):
+                try:
+                    payload = json.loads(content)
+                    ok, resp = post_json_timeout("/embed/json", payload, timeout_sec=600)
+                    if ok:
+                        out = json.dumps(resp, ensure_ascii=False, indent=2)
+                        st.download_button(
+                            label="💾 Download JSON + embeddings",
+                            data=out,
+                            file_name="enriched_with_embeddings.json",
+                            mime="application/json",
+                            key="download_enriched_json"
+                        )
+                        st.success("Embeddings added to JSON")
+                    else:
+                        st.error("Failed to add embeddings")
+                        st.json(resp)
+                except Exception as e:
+                    st.error(f"Embedding error: {e}")
+
+# ---------------------------- Search Tab ----------------------------
+with tabs[3]:
     st.subheader("Search")
     query = st.text_input("Query", value="hello", key="search_query")
     focal = st.text_input("Focal node UUID (optional)", key="search_focal")
@@ -813,7 +915,7 @@ with tabs[2]:
             st.json(data)
 
 # ---------------------------- Cache Tab ----------------------------
-with tabs[3]:
+with tabs[5]:
     st.subheader("Cache Management")
     
     # Cache stats
@@ -939,6 +1041,40 @@ with tabs[4]:
             else:
                 st.warning("Please enter a group_id")
     
+    st.markdown("---")
+    st.markdown("### Embedding Debug")
+    with st.expander("Compute embeddings and cosine similarities", expanded=False):
+        mode = st.radio("Mode", ["Texts matrix", "Pairs"], horizontal=True, key="embed_mode")
+        if mode == "Texts matrix":
+            texts_raw = st.text_area("Enter texts (one per line)", value="xin chào\nchào bạn\ntôi ăn cơm", height=120, key="embed_texts")
+            if st.button("Run Embedding (Texts)", key="embed_btn_texts"):
+                texts = [t for t in texts_raw.splitlines() if t.strip()]
+                ok, data = post_json("/debug/embed", {"texts": texts})
+                if ok:
+                    st.success("Embeddings computed")
+                    if data.get("cosine_matrix"):
+                        st.write("Cosine similarity matrix:")
+                        st.dataframe(data.get("cosine_matrix"))
+                else:
+                    st.error("Failed")
+                    st.json(data)
+        else:
+            pairs_raw = st.text_area("Enter pairs (one per line: a | b)", value="xin chào | chào bạn\nhello | goodbye", height=120, key="embed_pairs")
+            pairs = []
+            for line in pairs_raw.splitlines():
+                if "|" in line:
+                    a, b = line.split("|", 1)
+                    pairs.append([a.strip(), b.strip()])
+            if st.button("Run Embedding (Pairs)", key="embed_btn_pairs"):
+                ok, data = post_json("/debug/embed", {"pairs": pairs})
+                if ok:
+                    st.success("Pair similarities computed")
+                    st.write("Cosine similarities (per pair):")
+                    st.write(data.get("pair_similarities", []))
+                else:
+                    st.error("Failed")
+                    st.json(data)
+
     st.markdown("---")
     st.markdown("### Current Session Info")
     st.json({

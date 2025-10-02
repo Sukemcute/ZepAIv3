@@ -18,11 +18,11 @@ async def get_graphiti() -> Graphiti:
     """Lấy Graphiti instance với caching"""
     global _graphiti
     if _graphiti is None:
-        # Graphiti uses OpenAI embeddings by default (text-embedding-ada-002)
-        # To use text-embedding-3-small, set OPENAI_EMBEDDING_MODEL env var
-        # Note: Graphiti may not support custom embedding models out of the box
-        # Check Graphiti docs for embedding configuration
-        
+        # Graphiti dùng OpenAI embeddings mặc định.
+        # Ta cho phép cấu hình model qua env để đảm bảo dùng model mới.
+        # Nếu biến không được set, đặt mặc định an toàn.
+        os.environ.setdefault("OPENAI_EMBEDDING_MODEL", os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"))
+
         _graphiti = Graphiti(
             uri=os.getenv("NEO4J_URI", "bolt://localhost:7687"),
             user=os.getenv("NEO4J_USER", "neo4j"),

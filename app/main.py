@@ -208,6 +208,137 @@ async def search(req: SearchRequest, graphiti=Depends(get_graphiti)):
     memory_cache.set(cache_key, result, ttl=1800)
     
     return result
+
+@app.post("/debug/embed")
+async def debug_embed(payload: dict):
+    """Compute embeddings and cosine similarities for given texts.
+    Payload examples:
+      {"texts": ["xin chào", "chào bạn", "tôi ăn cơm"]}
+      or {"pairs": [["a", "b"], ["a", "c"]]}
+    Returns normalized vectors and cosine similarities.
+    """
+    try:
+        from openai import OpenAI
+        import math
+        import os
+
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        model = os.getenv("OPENAI_EMBEDDING_MODEL", os.getenv("OPENAI_EMBEDDING_MODEL" ,"text-embedding-3-small"))
+
+        def l2_normalize(vec: list[float]) -> list[float]:
+            norm = math.sqrt(sum(v*v for v in vec)) or 1.0
+            return [v / norm for v in vec]
+
+        def cosine(a: list[float], b: list[float]) -> float:
+            return sum(x*y for x, y in zip(a, b))
+
+        texts = payload.get("texts")
+        pairs = payload.get("pairs")
+
+        results = {}
+
+        if texts and isinstance(texts, list):
+            emb = client.embeddings.create(model=model, input=texts)
+            vecs = [l2_normalize(e.embedding) for e in emb.data]
+            results["texts"] = texts
+            results["vectors"] = vecs
+            # pairwise cosine
+            sims = []
+            for i in range(len(vecs)):
+                row = []
+                for j in range(len(vecs)):
+                    row.append(round(cosine(vecs[i], vecs[j]), 6))
+                sims.append(row)
+            results["cosine_matrix"] = sims
+
+        if pairs and isinstance(pairs, list):
+            flat = []
+            idx = []
+            for a, b in pairs:
+                idx.append((len(flat), len(flat)+1))
+                flat.extend([a, b])
+            emb = client.embeddings.create(model=model, input=flat)
+            vecs = [l2_normalize(e.embedding) for e in emb.data]
+            pair_sims = []
+            for i_a, i_b in idx:
+                pair_sims.append(round(cosine(vecs[i_a], vecs[i_b]), 6))
+            results["pairs"] = pairs
+            results["pair_similarities"] = pair_sims
+
+        return results
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Embedding debug failed: {str(e)}")
+
+@app.post("/embed/json")
+async def embed_json(payload: dict):
+    """Add embeddings into provided JSON.
+    Supported inputs:
+      - {"format": "mid_term", "mid_term": [{"id":..., "text":..., "metadata": {...}}, ...]}
+      - {"texts": ["..."]}
+      - {"entities": [{"uuid":..., "summary":...}, ...]}  # raw format
+    Returns the same structure with an added field "embedding" (L2-normalized floats).
+    """
+    try:
+        from openai import OpenAI
+        import os, math
+
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        model = os.getenv("OPENAI_EMBEDDING_MODEL", os.getenv("OPENAI_EMBEDDING_MODEL" ,"text-embedding-3-small"))
+
+        def l2_normalize(vec: list[float]) -> list[float]:
+            norm = math.sqrt(sum(v*v for v in vec)) or 1.0
+            return [v / norm for v in vec]
+
+        # Collect texts depending on structure
+        to_embed: list[str] = []
+        index_map: list[tuple[str, int]] = []  # (section, idx)
+
+        fmt = payload.get("format")
+        if fmt == "mid_term" and isinstance(payload.get("mid_term"), list):
+            for i, entry in enumerate(payload["mid_term"]):
+                text = (entry or {}).get("text")
+                if isinstance(text, str) and text.strip():
+                    index_map.append(("mid_term", i))
+                    to_embed.append(text)
+        elif isinstance(payload.get("texts"), list):
+            for i, text in enumerate(payload["texts"]):
+                if isinstance(text, str) and text.strip():
+                    index_map.append(("texts", i))
+                    to_embed.append(text)
+        elif isinstance(payload.get("entities"), list):
+            for i, ent in enumerate(payload["entities"]):
+                text = (ent or {}).get("summary") or (ent or {}).get("name")
+                if isinstance(text, str) and text.strip():
+                    index_map.append(("entities", i))
+                    to_embed.append(text)
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported JSON shape. Use format=mid_term, or texts, or entities.")
+
+        # Batch embed (OpenAI supports batching; chunk to avoid oversized requests)
+        vectors: list[list[float]] = []
+        batch_size = 512
+        for i in range(0, len(to_embed), batch_size):
+            chunk = to_embed[i:i+batch_size]
+            emb = client.embeddings.create(model=model, input=chunk)
+            vectors.extend([l2_normalize(e.embedding) for e in emb.data])
+
+        # Write back embeddings
+        for (section, idx), vec in zip(index_map, vectors):
+            if section == "mid_term":
+                payload["mid_term"][idx]["embedding"] = vec
+            elif section == "texts":
+                # Create parallel array if not exists
+                if "embeddings" not in payload:
+                    payload["embeddings"] = [None] * len(payload["texts"])
+                payload["embeddings"][idx] = vec
+            elif section == "entities":
+                payload["entities"][idx]["embedding"] = vec
+
+        return payload
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Embed JSON failed: {str(e)}")
 @app.get("/")
 def root():
     return {
@@ -304,6 +435,143 @@ async def ingest_json(payload: IngestJSON, graphiti=Depends(get_graphiti)):
     invalidate_search_cache()
     
     return {"episode_id": getattr(ep, "id", payload.name)}
+
+def _parse_iso_ts(value: str | None) -> datetime:
+    """Robust ISO8601 parser that accepts 'Z' suffix and various formats.
+    Falls back to UTC now on failure.
+    """
+    if not value:
+        return datetime.utcnow()
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        try:
+            # Try common alternate formats
+            from dateutil import parser as dtparser  # optional dependency
+            return dtparser.parse(value)
+        except Exception:
+            return datetime.utcnow()
+
+
+@app.post("/import/conversation")
+async def import_conversation(payload: dict, graphiti=Depends(get_graphiti)):
+    """
+    Import conversation from JSON file (mid_term or raw format)
+    
+    Supports:
+    - mid_term format: {format: "mid_term", mid_term: [...]}
+    - raw format: {format: "raw", entities: [...]}
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    try:
+        file_format = payload.get("format", "unknown")
+        imported_count = 0
+        failed_count = 0
+        item_errors: list[dict] = []
+        
+        if file_format == "mid_term":
+            # Import mid_term format
+            entries = payload.get("mid_term", [])
+            group_id = payload.get("group_id", "imported")
+            
+            logger.info(f"Importing {len(entries)} mid_term entries to group_id: {group_id}")
+            
+            for entry in entries:
+                try:
+                    text = entry.get("text", "")
+                    metadata = entry.get("metadata", {})
+                    timestamp = metadata.get("timestamp", None)
+                    
+                    if not text or len(text.strip()) < 3:
+                        continue
+                    
+                    # Ingest each entry as text episode
+                    ts = _parse_iso_ts(timestamp)
+                    
+                    await graphiti.add_episode(
+                        name=f"imported_{entry.get('id', 'unknown')}",
+                        episode_body=text,
+                        source=EpisodeType.text,
+                        source_description=f"imported_from_{metadata.get('source', 'unknown')}",
+                        reference_time=ts,
+                        group_id=group_id,
+                    )
+                    
+                    imported_count += 1
+                    
+                except Exception as e:
+                    logger.error(f"Failed to import entry: {e}")
+                    item_errors.append({"id": entry.get("id"), "error": str(e)})
+                    failed_count += 1
+                    continue
+            
+            invalidate_search_cache()
+            
+            return {
+                "success": True,
+                "format": "mid_term",
+                "imported": imported_count,
+                "failed": failed_count,
+                "group_id": group_id,
+                "errors": item_errors[:10]  # return first 10 errors for brevity
+            }
+            
+        elif file_format == "raw":
+            # Import raw format
+            entities = payload.get("entities", [])
+            group_id = payload.get("group_id", "imported")
+            
+            logger.info(f"Importing {len(entities)} raw entities to group_id: {group_id}")
+            
+            for entity in entities:
+                try:
+                    summary = entity.get("summary", "") or entity.get("name", "")
+                    created_at = entity.get("created_at", None)
+                    
+                    if not summary or len(summary.strip()) < 3:
+                        continue
+                    
+                    ts = _parse_iso_ts(created_at)
+                    
+                    await graphiti.add_episode(
+                        name=f"imported_{entity.get('uuid', 'unknown')}",
+                        episode_body=summary,
+                        source=EpisodeType.text,
+                        source_description="imported_from_raw",
+                        reference_time=ts,
+                        group_id=group_id,
+                    )
+                    
+                    imported_count += 1
+                    
+                except Exception as e:
+                    logger.error(f"Failed to import entity: {e}")
+                    item_errors.append({"uuid": entity.get("uuid"), "error": str(e)})
+                    failed_count += 1
+                    continue
+            
+            invalidate_search_cache()
+            
+            return {
+                "success": True,
+                "format": "raw",
+                "imported": imported_count,
+                "failed": failed_count,
+                "group_id": group_id,
+                "errors": item_errors[:10]
+            }
+        
+        else:
+            return {
+                "success": False,
+                "error": f"Unsupported format: {file_format}. Supported: mid_term, raw",
+            }
+            
+    except Exception as e:
+        logger.error(f"Import failed: {e}")
+        return {"success": False, "error": str(e)}
 
 # Cache management endpoints
 @app.get("/cache/stats")
